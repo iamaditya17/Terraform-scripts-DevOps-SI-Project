@@ -1,0 +1,218 @@
+# Provider configuration
+provider "aws" {
+  region = "us-east-1"  # Set your desired AWS region here
+}
+
+# Create VPC
+resource "aws_vpc" "eks_vpc" {
+  cidr_block = "10.0.0.0/16"
+  
+   tags = {
+    Name = "my-eks-vpc"
+  }
+}
+
+# Create public subnets
+resource "aws_subnet" "public_subnet" {
+  count             = 2
+  vpc_id            = aws_vpc.eks_vpc.id
+  cidr_block        = var.public_subnet_cidr_blocks[count.index]
+  availability_zone      = var.public_subnet_availability_zones[count.index]
+}
+
+# Variables for CIDR 
+variable "public_subnet_cidr_blocks" {
+  type    = list(string)
+  default = ["10.0.1.0/24", "10.0.2.0/24"]
+}
+
+# Variables for A.Zone
+variable "public_subnet_availability_zones" {
+  type    = list(string)
+  default = ["us-east-1a", "us-east-1b"]
+}
+
+# Create public subnets association with route table
+resource "aws_route_table_association" "public_subnet_association" {
+  count          = 2
+  subnet_id      = aws_subnet.public_subnet[count.index].id
+  route_table_id = aws_route_table.terraform_route_table.id
+}
+
+# Create internet gateway
+resource "aws_internet_gateway" "terraform_igw" {
+  vpc_id = aws_vpc.eks_vpc.id
+}
+
+# Create route table
+resource "aws_route_table" "terraform_route_table" {
+  vpc_id = aws_vpc.eks_vpc.id
+}
+
+# Create route to internet gateway
+resource "aws_route" "terraform_route" {
+  route_table_id         = aws_route_table.terraform_route_table.id
+  destination_cidr_block = "0.0.0.0/0"
+  gateway_id             = aws_internet_gateway.terraform_igw.id
+}
+
+# Create private subnets
+resource "aws_subnet" "private_subnet" {
+  count             = 2
+  vpc_id            = aws_vpc.eks_vpc.id
+  cidr_block        = var.private_subnet_cidr_blocks[count.index]
+  availability_zone      = var.private_subnet_availability_zones[count.index]
+}
+
+# Variables
+variable "private_subnet_cidr_blocks" {
+  type    = list(string)
+  default = ["10.0.3.0/24", "10.0.4.0/24"]
+}
+
+# Variables for A.Zone
+variable "private_subnet_availability_zones" {
+  type    = list(string)
+  default = ["us-east-1a", "us-east-1b"]
+}
+
+# Create NAT gateways for Private Subnets
+resource "aws_nat_gateway" "terraform_nat_gateway" {
+  count         = 2
+  allocation_id = aws_eip.terraform_eip[count.index].id
+  subnet_id     = aws_subnet.private_subnet[count.index].id
+}
+
+# Create Elastic IP for NAT gateway
+resource "aws_eip" "terraform_eip" {
+  count = 2
+  vpc   = true
+}
+
+# Create EKS cluster
+resource "aws_eks_cluster" "eks_cluster" {
+  name     = "my-eks-cluster"
+  role_arn = aws_iam_role.eks_master_role.arn
+  version  = "1.27"  # Replace with a supported Kubernetes version
+  vpc_config {
+    subnet_ids = concat(aws_subnet.public_subnet[*].id, aws_subnet.private_subnet[*].id)
+  }
+}
+
+# Create IAM role for EKS cluster
+resource "aws_iam_role" "eks_master_role" {
+  name = "eks-master-role"
+
+  assume_role_policy = <<EOF
+    {
+	  "Version": "2012-10-17",
+	  "Statement": [
+		{
+		  "Effect": "Allow",
+		  "Principal": {
+			"Service": "eks.amazonaws.com"
+		  },
+		  "Action": "sts:AssumeRole"
+		}
+	  ]
+	}
+EOF
+
+managed_policy_arns = [
+    "arn:aws:iam::aws:policy/AmazonEKSClusterPolicy"
+  ]
+
+}
+
+# Create IAM roles for the EKS cluster (Worker)
+resource "aws_iam_role" "eks_worker_role" {
+  name = "eks-worker-role"
+
+  assume_role_policy = jsonencode({
+    Version   = "2012-10-17"
+    Statement = [
+      {
+        Action    = "sts:AssumeRole"
+        Effect    = "Allow"
+        Principal = {
+          Service = "ec2.amazonaws.com"
+       }
+      }
+    ]
+  })
+
+  managed_policy_arns = [
+    "arn:aws:iam::aws:policy/AmazonEKSClusterPolicy"
+  ]
+}
+
+
+# Create the launch template for worker nodes
+resource "aws_launch_template" "worker_lt" {
+  name_prefix   = "eks-worker-launchTemplate"
+  image_id      = "ami-0c94855ba95c71c99"  # Replace with the desired Amazon Linux AMI ID
+  instance_type = "t2.medium"     # Replace with your desired instance type
+
+  block_device_mappings {
+    device_name = "/dev/xvda"
+    ebs {
+      volume_size = 8  # Replace with your desired root volume size in GB
+    }
+  }
+}
+# Create Security Group for master nodes
+resource "aws_security_group" "master_security_group" {
+  name        = "eks-master-sg"
+  description = "Security group for EKS master nodes"
+
+  vpc_id = aws_vpc.eks_vpc.id
+
+  ingress {
+    from_port   = 443
+    to_port     = 443
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  ingress {
+    from_port   = 1025
+    to_port     = 65535
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+}
+
+
+# Create autoscaling group for master nodes
+resource "aws_autoscaling_group" "worker_autoscaling_group" {
+  name = "eks-worker-asg"
+  
+   launch_template {
+    id      = aws_launch_template.worker_lt.id
+    version = "$Latest"
+  }
+  
+  desired_capacity     = 3
+  max_size             = 4
+  min_size             = 2
+
+  vpc_zone_identifier = aws_subnet.private_subnet[*].id
+
+  tag {
+    key                 = "Name"
+    value               = "eks-worker-node"
+    propagate_at_launch = true
+  }
+}
+
+# Output
+output "eks_cluster_endpoint" {
+  value = aws_eks_cluster.eks_cluster.endpoint
+}
